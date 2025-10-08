@@ -11,10 +11,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-# NOTE: Using environment variables is the correct way to manage these in production.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8455948992:AAGbO8Hkw8OOgAMrhWhuc6JjVqI9QjOUQ0g")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_BOT_TOKEN", "824922767") # Assuming this is a chat ID if needed elsewhere
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_BOT_TOKEN", "824922767")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "105850")
+ALERT_FILE = "price_alerts.json" # File for persistence
 
 # Price alerts storage
 price_alerts = {}
@@ -23,10 +23,37 @@ price_alerts = {}
 deriv_ws = None
 monitoring_task = None
 
+# --- PERSISTENCE FUNCTIONS ---
+
+def load_alerts():
+    """Load price alerts from a JSON file."""
+    global price_alerts
+    if os.path.exists(ALERT_FILE):
+        try:
+            with open(ALERT_FILE, 'r') as f:
+                data = json.load(f)
+                # Convert string keys (from JSON) back to int for alert_ids
+                price_alerts = {
+                    symbol: {int(k): v for k, v in alerts.items()}
+                    for symbol, alerts in data.items()
+                }
+            logger.info(f"Loaded {sum(len(a) for a in price_alerts.values())} alerts from {ALERT_FILE}")
+        except Exception as e:
+            logger.error(f"Error loading alerts from file: {e}")
+
+def save_alerts():
+    """Save price alerts to a JSON file."""
+    try:
+        with open(ALERT_FILE, 'w') as f:
+            json.dump(price_alerts, f, indent=4)
+    except Exception as e:
+        logger.error(f"Error saving alerts to file: {e}")
+
+# --- DERIV CONNECTION AND MONITORING ---
+
 async def connect_deriv():
     """Connect to Deriv WebSocket API"""
     global deriv_ws
-    # Check if a connection exists and is open
     if deriv_ws and not deriv_ws.closed:
         return deriv_ws 
 
@@ -54,20 +81,17 @@ async def monitor_prices(application):
     """Monitor prices and send alerts"""
     global deriv_ws
     
-    # Track which symbols are currently subscribed
     active_subscriptions = set()
 
     while True:
         try:
             if deriv_ws is None or deriv_ws.closed:
                 await connect_deriv()
-                # Re-subscribe to all symbols that have active alerts after reconnection
                 for symbol in price_alerts:
                     if symbol not in active_subscriptions:
                          await subscribe_to_symbol(symbol)
                          active_subscriptions.add(symbol)
             
-            # Update active subscriptions set
             symbols_with_alerts = set(price_alerts.keys())
             active_subscriptions = active_subscriptions.intersection(symbols_with_alerts)
 
@@ -78,7 +102,6 @@ async def monitor_prices(application):
                 symbol = data["tick"]["symbol"]
                 current_price = float(data["tick"]["quote"])
                 
-                # Check alerts for this symbol
                 if symbol in price_alerts:
                     alerts_to_remove = []
                     
@@ -105,31 +128,34 @@ async def monitor_prices(application):
                             except Exception as e:
                                 logger.error(f"Error sending alert to chat {chat_id}: {e}")
                     
-                    # Remove triggered alerts
                     for alert_id in alerts_to_remove:
                         del price_alerts[symbol][alert_id]
                     
-                    # Clean up empty symbol entries
                     if not price_alerts[symbol]:
                         del price_alerts[symbol]
-                        active_subscriptions.discard(symbol) # Remove from active list
+                        active_subscriptions.discard(symbol)
+                        
+                    # Save alerts after triggering/removing them
+                    save_alerts() 
                         
             elif data.get('msg_type') == 'ping':
                 await deriv_ws.send(json.dumps({'pong': 1}))
                 
         except asyncio.TimeoutError:
-            logger.warning("WebSocket timeout (no message received). Trying to maintain connection/reconnect...")
+            logger.warning("WebSocket timeout. Reconnecting...")
             deriv_ws = None 
         except asyncio.CancelledError:
             logger.info("Monitoring task cancelled")
             break
-        except websockets.exceptions.ConnectionClosed: # Catches various closure exceptions
+        except websockets.exceptions.ConnectionClosed:
             logger.info("Deriv WebSocket connection closed. Reconnecting...")
             deriv_ws = None
         except Exception as e:
             logger.error(f"Error monitoring prices: {e}")
             await asyncio.sleep(5)
             deriv_ws = None 
+
+# --- TELEGRAM COMMAND HANDLERS ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
@@ -139,11 +165,13 @@ Welcome to Deriv Price Alert Bot! 🤖
 Available commands:
 /setalert <symbol> <above/below> <price> - Set a price alert
 /listalerts - List your active alerts
+/deletealert <symbol> <id> - Delete a specific alert
 /symbols - Show available symbols
 /price <symbol> - Get current price
 
 Example:
 /setalert R_10 above 500.50
+/deletealert R_10 1
 """
     await update.message.reply_text(welcome_message)
 
@@ -192,10 +220,8 @@ async def setalert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Condition must be 'above' or 'below'")
             return
         
-        # Create alert
         if symbol not in price_alerts:
             price_alerts[symbol] = {}
-            # Subscribe to this symbol when the first alert is set
             await subscribe_to_symbol(symbol)
         
         alert_id = len(price_alerts[symbol]) + 1
@@ -205,6 +231,8 @@ async def setalert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "chat_id": update.effective_chat.id
         }
         
+        save_alerts() # Save the new alert
+
         await update.message.reply_text(
             f"✅ Alert set!\n"
             f"Symbol: {symbol}\n"
@@ -237,8 +265,49 @@ async def listalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     await update.message.reply_text(message)
 
+async def deletealert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /deletealert <symbol> <alert_id> command"""
+    chat_id = update.effective_chat.id
+    
+    try:
+        if len(context.args) != 2:
+            await update.message.reply_text(
+                "Usage: /deletealert <symbol> <alert_id>\n"
+                "Example: /deletealert R_10 1\n"
+                "Use /listalerts to see IDs."
+            )
+            return
+        
+        symbol = context.args[0].upper()
+        alert_id = int(context.args[1])
+        
+        if symbol not in price_alerts or alert_id not in price_alerts[symbol]:
+            await update.message.reply_text(f"Alert ID {alert_id} for {symbol} not found.")
+            return
+        
+        alert = price_alerts[symbol][alert_id]
+        
+        if alert["chat_id"] != chat_id:
+            await update.message.reply_text("You can only delete your own alerts.")
+            return
+
+        del price_alerts[symbol][alert_id]
+        
+        if not price_alerts[symbol]:
+            del price_alerts[symbol]
+
+        save_alerts() # Save after deleting
+
+        await update.message.reply_text(f"🗑️ Alert ID {alert_id} for {symbol} deleted successfully.")
+        
+    except ValueError:
+        await update.message.reply_text("Invalid Alert ID or format. ID must be a number.")
+    except Exception as e:
+        logger.error(f"Error in deletealert: {e}")
+        await update.message.reply_text(f"Error deleting alert: {str(e)}")
+
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get current price for a symbol"""
+    # ... (content remains the same as before) ...
     if len(context.args) != 1:
         await update.message.reply_text("Usage: /price <symbol>\nExample: /price R_10")
         return
@@ -249,16 +318,13 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if deriv_ws is None or deriv_ws.closed:
             await connect_deriv()
 
-        # Send request for current price (non-subscribed tick)
         request = {"ticks": symbol, "passthrough": {"command": "price_request"}}
         await deriv_ws.send(json.dumps(request))
         
-        # Wait for response with the corresponding passthrough
         while True:
             response = await asyncio.wait_for(deriv_ws.recv(), timeout=10.0)
             data = json.loads(response)
             
-            # Check if it's the response to *this* price request
             if data.get("msg_type") == "tick" and data.get("echo_req", {}).get("passthrough", {}).get("command") == "price_request":
                 price = data["tick"]["quote"]
                 await update.message.reply_text(f"💰 {symbol}: {price}")
@@ -266,7 +332,6 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif "error" in data and data.get("echo_req", {}).get("ticks") == symbol:
                 await update.message.reply_text(f"Error: {data['error']['message']}")
                 break
-            # Ignore other messages (like subscription ticks) and keep waiting
             if data.get("msg_type") != "tick":
                  continue
             else:
@@ -279,29 +344,34 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in price command: {e}")
         await update.message.reply_text(f"Error: {str(e)}")
 
-# ----------------------------------------------------
-# APPLICATION HOOKS (The Fix for 'Cannot close a running event loop')
-# ----------------------------------------------------
+# --- APPLICATION HOOKS (The Fix) ---
 
 async def start_and_monitor(application: Application):
     """
     Called by Application.run_polling() post-initialization.
-    Used to set up external async tasks (WebSocket connection and monitoring).
+    Loads alerts, connects to Deriv, and starts the monitoring task.
     """
     global monitoring_task
     
-    # 1. Connect to Deriv
+    # 1. Load persisted alerts
+    load_alerts()
+    
+    # 2. Connect to Deriv
     await connect_deriv()
     
-    # 2. Start price monitoring in background
+    # 3. Start price monitoring in background
     monitoring_task = asyncio.create_task(monitor_prices(application))
+    
+    # 4. Re-subscribe to symbols that were loaded from the file
+    for symbol in price_alerts.keys():
+        await subscribe_to_symbol(symbol)
     
     logger.info("Bot started! Running polling loop...")
 
 async def shutdown_async(application: Application):
     """
     Called by Application.run_polling() post-shutdown.
-    Used to clean up external async tasks and connections.
+    Cleans up external async tasks and connections.
     """
     global deriv_ws, monitoring_task
     
@@ -324,40 +394,34 @@ async def shutdown_async(application: Application):
     
     logger.info("Shutdown of external resources complete.")
 
-# ----------------------------------------------------
-# SYNCHRONOUS ENTRY POINT
-# ----------------------------------------------------
+# --- SYNCHRONOUS ENTRY POINT ---
 
 def main():
     """Synchronous entry point that delegates event loop management to run_polling."""
     
     try:
-        # 1. Create Telegram bot application (synchronous)
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
-        # 2. Add command handlers (synchronous)
+        # Add command handlers
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("setalert", setalert_command))
         application.add_handler(CommandHandler("listalerts", listalerts_command))
+        application.add_handler(CommandHandler("deletealert", deletealert_command)) # New Handler
         application.add_handler(CommandHandler("symbols", symbols_command))
         application.add_handler(CommandHandler("price", price_command))
 
-        # 3. Assign hooks to integrate external async logic safely
+        # Assign hooks to integrate external async logic safely
         application.post_init = start_and_monitor
         application.post_shutdown = shutdown_async
 
-        # 4. Start the application. This is a synchronous, blocking call 
-        # that manages the entire event loop lifecycle.
+        # Start the application. This blocks until terminated.
         application.run_polling(drop_pending_updates=True)
 
     except Exception as e:
         logger.error(f"Error in main: {e}", exc_info=True)
-        # Note: application.run_polling() usually catches KeyboardInterrupt/SystemExit
-        # but logging it here is good practice.
 
 if __name__ == "__main__":
     try:
-        # Simply call the synchronous main function
         main()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
