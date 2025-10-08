@@ -20,6 +20,7 @@ price_alerts = {}
 
 # Deriv WebSocket connection
 deriv_ws = None
+monitoring_task = None
 
 async def connect_deriv():
     """Connect to Deriv WebSocket API"""
@@ -31,12 +32,15 @@ async def connect_deriv():
 
 async def subscribe_to_symbol(symbol):
     """Subscribe to price updates for a symbol"""
-    subscribe_request = {
-        "ticks": symbol,
-        "subscribe": 1
-    }
-    await deriv_ws.send(json.dumps(subscribe_request))
-    logger.info(f"Subscribed to {symbol}")
+    try:
+        subscribe_request = {
+            "ticks": symbol,
+            "subscribe": 1
+        }
+        await deriv_ws.send(json.dumps(subscribe_request))
+        logger.info(f"Subscribed to {symbol}")
+    except Exception as e:
+        logger.error(f"Error subscribing to {symbol}: {e}")
 
 async def monitor_prices(application):
     """Monitor prices and send alerts"""
@@ -44,10 +48,10 @@ async def monitor_prices(application):
     
     while True:
         try:
-            if deriv_ws is None:
+            if deriv_ws is None or deriv_ws.closed:
                 await connect_deriv()
             
-            response = await deriv_ws.recv()
+            response = await asyncio.wait_for(deriv_ws.recv(), timeout=30.0)
             data = json.loads(response)
             
             if "tick" in data:
@@ -58,7 +62,7 @@ async def monitor_prices(application):
                 if symbol in price_alerts:
                     alerts_to_remove = []
                     
-                    for alert_id, alert in price_alerts[symbol].items():
+                    for alert_id, alert in list(price_alerts[symbol].items()):
                         target_price = alert["target_price"]
                         condition = alert["condition"]
                         chat_id = alert["chat_id"]
@@ -72,16 +76,29 @@ async def monitor_prices(application):
                             message = f"🚨 ALERT: {symbol} is now {current_price:.2f} (below {target_price:.2f})"
                         
                         if triggered:
-                            await application.bot.send_message(
-                                chat_id=chat_id,
-                                text=message
-                            )
-                            alerts_to_remove.append(alert_id)
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=message
+                                )
+                                alerts_to_remove.append(alert_id)
+                            except Exception as e:
+                                logger.error(f"Error sending alert: {e}")
                     
                     # Remove triggered alerts
                     for alert_id in alerts_to_remove:
                         del price_alerts[symbol][alert_id]
+                    
+                    # Clean up empty symbol entries
+                    if not price_alerts[symbol]:
+                        del price_alerts[symbol]
                         
+        except asyncio.TimeoutError:
+            logger.warning("WebSocket timeout, reconnecting...")
+            deriv_ws = None
+        except asyncio.CancelledError:
+            logger.info("Monitoring task cancelled")
+            break
         except Exception as e:
             logger.error(f"Error monitoring prices: {e}")
             await asyncio.sleep(5)
@@ -171,6 +188,7 @@ async def setalert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Invalid price value. Please use a number.")
     except Exception as e:
+        logger.error(f"Error in setalert: {e}")
         await update.message.reply_text(f"Error setting alert: {str(e)}")
 
 async def listalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,27 +224,50 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deriv_ws.send(json.dumps(request))
         
         # Wait for response
-        response = await deriv_ws.recv()
+        response = await asyncio.wait_for(deriv_ws.recv(), timeout=10.0)
         data = json.loads(response)
         
         if "tick" in data:
             price = data["tick"]["quote"]
             await update.message.reply_text(f"💰 {symbol}: {price}")
+        elif "error" in data:
+            await update.message.reply_text(f"Error: {data['error']['message']}")
         else:
             await update.message.reply_text(f"Could not get price for {symbol}")
             
+    except asyncio.TimeoutError:
+        await update.message.reply_text("Request timed out. Please try again.")
     except Exception as e:
+        logger.error(f"Error in price command: {e}")
         await update.message.reply_text(f"Error: {str(e)}")
 
-def main():
+async def shutdown(application):
+    """Graceful shutdown"""
+    global deriv_ws, monitoring_task
+    
+    logger.info("Shutting down bot...")
+    
+    # Cancel monitoring task
+    if monitoring_task and not monitoring_task.done():
+        monitoring_task.cancel()
+        try:
+            await monitoring_task
+        except asyncio.CancelledError:
+            pass
+    
+    # Close WebSocket connection
+    if deriv_ws and not deriv_ws.closed:
+        await deriv_ws.close()
+    
+    logger.info("Shutdown complete")
+
+async def main():
     """Start the bot"""
-    # Create a new event loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    global monitoring_task
     
     try:
         # Connect to Deriv
-        loop.run_until_complete(connect_deriv())
+        await connect_deriv()
         
         # Create Telegram bot application
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -239,16 +280,35 @@ def main():
         application.add_handler(CommandHandler("price", price_command))
         
         # Start price monitoring in background
-        loop.create_task(monitor_prices(application))
+        monitoring_task = asyncio.create_task(monitor_prices(application))
         
         # Start the bot
         logger.info("Bot started!")
-        application.run_polling()
         
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        # Initialize and run the application
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        
+        # Keep running until interrupted
+        try:
+            await asyncio.Event().wait()
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Received exit signal")
+        
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+        raise
     finally:
-        loop.close()
+        # Cleanup
+        if 'application' in locals():
+            await shutdown(application)
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
