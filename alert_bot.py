@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # NOTE: Using environment variables is the correct way to manage these in production.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8455948992:AAGbO8Hkw8OOgAMrhWhuc6JjVqI9QjOUQ0g")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "824922767")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_BOT_TOKEN", "824922767") # Assuming this is a chat ID if needed elsewhere
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "105850")
 
 # Price alerts storage
@@ -28,7 +28,7 @@ async def connect_deriv():
     global deriv_ws
     # Check if a connection exists and is open
     if deriv_ws and not deriv_ws.closed:
-        return deriv_ws # Connection is already active
+        return deriv_ws 
 
     uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     deriv_ws = await websockets.connect(uri)
@@ -269,7 +269,6 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Ignore other messages (like subscription ticks) and keep waiting
             if data.get("msg_type") != "tick":
                  continue
-            # If we fall through, something unexpected happened
             else:
                  await update.message.reply_text(f"Could not get price for {symbol}")
                  break
@@ -280,12 +279,30 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in price command: {e}")
         await update.message.reply_text(f"Error: {str(e)}")
 
-# ---
-# GRACEFUL SHUTDOWN AND ENTRY POINT FIX
-# ---
+# ----------------------------------------------------
+# APPLICATION HOOKS (The Fix for 'Cannot close a running event loop')
+# ----------------------------------------------------
 
-async def shutdown_async():
-    """Graceful shutdown for external resources (monitoring task and WebSocket)."""
+async def start_and_monitor(application: Application):
+    """
+    Called by Application.run_polling() post-initialization.
+    Used to set up external async tasks (WebSocket connection and monitoring).
+    """
+    global monitoring_task
+    
+    # 1. Connect to Deriv
+    await connect_deriv()
+    
+    # 2. Start price monitoring in background
+    monitoring_task = asyncio.create_task(monitor_prices(application))
+    
+    logger.info("Bot started! Running polling loop...")
+
+async def shutdown_async(application: Application):
+    """
+    Called by Application.run_polling() post-shutdown.
+    Used to clean up external async tasks and connections.
+    """
     global deriv_ws, monitoring_task
     
     logger.info("Starting graceful shutdown of external resources...")
@@ -307,21 +324,12 @@ async def shutdown_async():
     
     logger.info("Shutdown of external resources complete.")
 
-async def start_bot_async(application):
-    """Contains the actual asynchronous bot startup logic."""
-    
-    # 1. Start price monitoring in background
-    global monitoring_task
-    monitoring_task = asyncio.create_task(monitor_prices(application))
-    
-    logger.info("Bot started! Running polling loop...")
-    
-    # 2. Start the bot. This call manages its own event loop logic.
-    await application.run_polling(drop_pending_updates=True)
+# ----------------------------------------------------
+# SYNCHRONOUS ENTRY POINT
+# ----------------------------------------------------
 
 def main():
-    """Synchronous entry point to manage the asyncio lifecycle."""
-    application = None
+    """Synchronous entry point that delegates event loop management to run_polling."""
     
     try:
         # 1. Create Telegram bot application (synchronous)
@@ -334,28 +342,18 @@ def main():
         application.add_handler(CommandHandler("symbols", symbols_command))
         application.add_handler(CommandHandler("price", price_command))
 
-        # 3. Connect to Deriv and then start the async bot loop
-        # We use asyncio.run to execute these async functions from the synchronous main().
-        # This prevents the nested loop conflict.
-        
-        # Initial connection (important for command handlers to work immediately)
-        asyncio.run(connect_deriv())
+        # 3. Assign hooks to integrate external async logic safely
+        application.post_init = start_and_monitor
+        application.post_shutdown = shutdown_async
 
-        # Run the core asynchronous part of the bot
-        asyncio.run(start_bot_async(application))
+        # 4. Start the application. This is a synchronous, blocking call 
+        # that manages the entire event loop lifecycle.
+        application.run_polling(drop_pending_updates=True)
 
     except Exception as e:
-        # Log any error that occurred
         logger.error(f"Error in main: {e}", exc_info=True)
-    finally:
-        # 4. Cleanup external resources
-        # The application.run_polling() handles the internal Telegram bot shutdown.
-        try:
-            # We must run the shutdown coroutine using asyncio.run
-            asyncio.run(shutdown_async())
-        except Exception as e:
-            # Errors here are usually "Cannot close a running event loop" if something failed earlier.
-            logger.error(f"Error during final cleanup: {e}")
+        # Note: application.run_polling() usually catches KeyboardInterrupt/SystemExit
+        # but logging it here is good practice.
 
 if __name__ == "__main__":
     try:
