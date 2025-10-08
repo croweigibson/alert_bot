@@ -1,1 +1,1 @@
-web: python your_file_name.py
+web: python alert_bot.py
