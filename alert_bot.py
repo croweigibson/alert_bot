@@ -11,8 +11,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-# NOTE: It's HIGHLY recommended to load these from actual environment variables.
-# The token and chat ID below are placeholders.
+# NOTE: Using environment variables is the correct way to manage these in production.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8455948992:AAGbO8Hkw8OOgAMrhWhuc6JjVqI9QjOUQ0g")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "824922767")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "105850")
@@ -27,6 +26,10 @@ monitoring_task = None
 async def connect_deriv():
     """Connect to Deriv WebSocket API"""
     global deriv_ws
+    # Check if a connection exists and is open
+    if deriv_ws and not deriv_ws.closed:
+        return deriv_ws # Connection is already active
+
     uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     deriv_ws = await websockets.connect(uri)
     logger.info("Connected to Deriv WebSocket")
@@ -35,7 +38,6 @@ async def connect_deriv():
 async def subscribe_to_symbol(symbol):
     """Subscribe to price updates for a symbol"""
     try:
-        # Re-connect if WebSocket is closed
         if deriv_ws is None or deriv_ws.closed:
             await connect_deriv()
 
@@ -52,7 +54,7 @@ async def monitor_prices(application):
     """Monitor prices and send alerts"""
     global deriv_ws
     
-    # Track which symbols are currently subscribed to prevent unnecessary re-subscriptions
+    # Track which symbols are currently subscribed
     active_subscriptions = set()
 
     while True:
@@ -65,13 +67,8 @@ async def monitor_prices(application):
                          await subscribe_to_symbol(symbol)
                          active_subscriptions.add(symbol)
             
-            # Remove symbols from active_subscriptions if they no longer have alerts
+            # Update active subscriptions set
             symbols_with_alerts = set(price_alerts.keys())
-            symbols_to_unsubscribe = active_subscriptions - symbols_with_alerts
-            # Note: Unsubscribing requires a dedicated API call, but simply removing them
-            # from our internal set prevents us from re-subscribing them on the next cycle.
-            # For simplicity, we only manage the local set and rely on Deriv's API to manage
-            # sessions, assuming it handles duplicate 'subscribe' requests gracefully.
             active_subscriptions = active_subscriptions.intersection(symbols_with_alerts)
 
             response = await asyncio.wait_for(deriv_ws.recv(), timeout=30.0)
@@ -115,25 +112,24 @@ async def monitor_prices(application):
                     # Clean up empty symbol entries
                     if not price_alerts[symbol]:
                         del price_alerts[symbol]
-                        active_subscriptions.discard(symbol) # Ensure it's removed from active list
+                        active_subscriptions.discard(symbol) # Remove from active list
                         
-            # Handle possible PING/PONG or other non-tick messages to keep connection alive
             elif data.get('msg_type') == 'ping':
                 await deriv_ws.send(json.dumps({'pong': 1}))
                 
         except asyncio.TimeoutError:
             logger.warning("WebSocket timeout (no message received). Trying to maintain connection/reconnect...")
-            deriv_ws = None # Force reconnection check on next loop
+            deriv_ws = None 
         except asyncio.CancelledError:
             logger.info("Monitoring task cancelled")
             break
-        except websockets.exceptions.ConnectionClosedOK:
-            logger.info("Deriv WebSocket connection closed gracefully. Reconnecting...")
+        except websockets.exceptions.ConnectionClosed: # Catches various closure exceptions
+            logger.info("Deriv WebSocket connection closed. Reconnecting...")
             deriv_ws = None
         except Exception as e:
             logger.error(f"Error monitoring prices: {e}")
             await asyncio.sleep(5)
-            deriv_ws = None # Force reconnection
+            deriv_ws = None 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
@@ -202,16 +198,6 @@ async def setalert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Subscribe to this symbol when the first alert is set
             await subscribe_to_symbol(symbol)
         
-        # Check for existing alert with the same parameters (optional, but good practice)
-        for alert_id, alert in price_alerts[symbol].items():
-            if alert["target_price"] == target_price and \
-               alert["condition"] == condition and \
-               alert["chat_id"] == update.effective_chat.id:
-                await update.message.reply_text(
-                    f"⚠️ Alert already exists for {symbol}: {condition} {target_price}"
-                )
-                return
-
         alert_id = len(price_alerts[symbol]) + 1
         price_alerts[symbol][alert_id] = {
             "target_price": target_price,
@@ -277,15 +263,13 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 price = data["tick"]["quote"]
                 await update.message.reply_text(f"💰 {symbol}: {price}")
                 break
-            elif "error" in data:
-                 # Check if the error is for this specific request (might be complex)
-                 if data.get("echo_req", {}).get("ticks") == symbol:
-                    await update.message.reply_text(f"Error: {data['error']['message']}")
-                    break
-            elif data.get("msg_type") != "tick":
-                 # Ignore other messages (like subscription ticks) and keep waiting
+            elif "error" in data and data.get("echo_req", {}).get("ticks") == symbol:
+                await update.message.reply_text(f"Error: {data['error']['message']}")
+                break
+            # Ignore other messages (like subscription ticks) and keep waiting
+            if data.get("msg_type") != "tick":
                  continue
-            # Note: For production, you'd track the request ID for certainty
+            # If we fall through, something unexpected happened
             else:
                  await update.message.reply_text(f"Could not get price for {symbol}")
                  break
@@ -297,11 +281,10 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {str(e)}")
 
 # ---
-# CRITICAL FIX: Simplified shutdown for external resources
-# The application.run_polling() handles the Telegram bot shutdown.
+# GRACEFUL SHUTDOWN AND ENTRY POINT FIX
 # ---
 
-async def shutdown(application):
+async def shutdown_async():
     """Graceful shutdown for external resources (monitoring task and WebSocket)."""
     global deriv_ws, monitoring_task
     
@@ -312,7 +295,6 @@ async def shutdown(application):
         logger.info("Cancelling price monitoring task...")
         monitoring_task.cancel()
         try:
-            # Wait for the task to finish its cancellation
             await monitoring_task
         except asyncio.CancelledError:
             logger.info("Monitoring task cancelled successfully.")
@@ -325,53 +307,61 @@ async def shutdown(application):
     
     logger.info("Shutdown of external resources complete.")
 
-async def main():
-    """Start the bot using the recommended application.run_polling() method."""
+async def start_bot_async(application):
+    """Contains the actual asynchronous bot startup logic."""
+    
+    # 1. Start price monitoring in background
     global monitoring_task
+    monitoring_task = asyncio.create_task(monitor_prices(application))
+    
+    logger.info("Bot started! Running polling loop...")
+    
+    # 2. Start the bot. This call manages its own event loop logic.
+    await application.run_polling(drop_pending_updates=True)
+
+def main():
+    """Synchronous entry point to manage the asyncio lifecycle."""
     application = None
     
     try:
-        # 1. Connect to Deriv
-        await connect_deriv()
-        
-        # 2. Create Telegram bot application
+        # 1. Create Telegram bot application (synchronous)
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
-        # 3. Add command handlers
+        # 2. Add command handlers (synchronous)
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("setalert", setalert_command))
         application.add_handler(CommandHandler("listalerts", listalerts_command))
         application.add_handler(CommandHandler("symbols", symbols_command))
         application.add_handler(CommandHandler("price", price_command))
+
+        # 3. Connect to Deriv and then start the async bot loop
+        # We use asyncio.run to execute these async functions from the synchronous main().
+        # This prevents the nested loop conflict.
         
-        # 4. Start price monitoring in background
-        monitoring_task = asyncio.create_task(monitor_prices(application))
-        
-        logger.info("Bot started! Running polling loop...")
-        
-        # 5. Start the bot. This is the correct, modern way. 
-        # It handles initialization, starting, and graceful stopping internally.
-        # It blocks until interrupted (e.g., Ctrl+C).
-        await application.run_polling(drop_pending_updates=True)
-        
+        # Initial connection (important for command handlers to work immediately)
+        asyncio.run(connect_deriv())
+
+        # Run the core asynchronous part of the bot
+        asyncio.run(start_bot_async(application))
+
     except Exception as e:
-        # Log any error that occurred before application.run_polling()
+        # Log any error that occurred
         logger.error(f"Error in main: {e}", exc_info=True)
-        # Re-raise the exception to be caught by the outer try/except
-        raise
     finally:
-        # 6. Cleanup only external resources. 
-        # application.run_polling() ensures the Telegram bot components are shut down.
-        if application:
-            await shutdown(application) 
+        # 4. Cleanup external resources
+        # The application.run_polling() handles the internal Telegram bot shutdown.
+        try:
+            # We must run the shutdown coroutine using asyncio.run
+            asyncio.run(shutdown_async())
+        except Exception as e:
+            # Errors here are usually "Cannot close a running event loop" if something failed earlier.
+            logger.error(f"Error during final cleanup: {e}")
 
 if __name__ == "__main__":
     try:
-        # asyncio.run handles the main event loop
-        asyncio.run(main())
+        # Simply call the synchronous main function
+        main()
     except KeyboardInterrupt:
-        # This catches the interrupt after application.run_polling() has returned
-        # and after the cleanup in the finally block of main() has run.
-        logger.info("Bot stopped by user (KeyboardInterrupt caught by asyncio.run)")
+        logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error outside main: {e}")
