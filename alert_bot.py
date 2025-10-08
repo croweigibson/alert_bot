@@ -1,4 +1,5 @@
 import asyncio
+import os
 import json
 import websockets
 from telegram import Update
@@ -10,9 +11,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-TELEGRAM_BOT_TOKEN = "8455948992:AAGbO8Hkw8OOgAMrhWhuc6JjVqI9QjOUQ0g"
-TELEGRAM_CHAT_ID = "824922767"
-DERIV_APP_ID = "105850"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8455948992:AAGbO8Hkw8OOgAMrhWhuc6JjVqI9QjOUQ0g")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "824922767")
+DERIV_APP_ID = os.getenv("DERIV_APP_ID", "105850")
 
 # Price alerts storage
 price_alerts = {}
